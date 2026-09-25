@@ -72,6 +72,26 @@ def _create_background(width: int, height: int) -> Image.Image:
     return img
 
 
+_AV_CACHE: dict[str, tuple[float, bytes]] = {}
+_AV_TTL = 1800
+_AV_MAX = 300
+
+
+async def _fetch_avatar_bytes(url: str) -> Optional[bytes]:
+    import time
+    hit = _AV_CACHE.get(url)
+    if hit and time.monotonic() - hit[0] < _AV_TTL:
+        return hit[1]
+    async with httpx.AsyncClient(timeout=6.0, follow_redirects=True) as client:
+        res = await client.get(url)
+    if res.status_code != 200:
+        return None
+    if len(_AV_CACHE) >= _AV_MAX:
+        _AV_CACHE.pop(next(iter(_AV_CACHE)))
+    _AV_CACHE[url] = (time.monotonic(), res.content)
+    return res.content
+
+
 async def _fetch_avatar(url: Optional[str], size: int) -> Image.Image:
     """Загрузка аватара или создание заменяющей заглушки с знакам '?'."""
     avatar_img = Image.new("RGBA", (size, size), (0, 0, 0, 0))
@@ -81,13 +101,12 @@ async def _fetch_avatar(url: Optional[str], size: int) -> Image.Image:
 
     if url:
         try:
-            async with httpx.AsyncClient(timeout=6.0, follow_redirects=True) as client:
-                res = await client.get(url)
-                if res.status_code == 200:
-                    raw_av = Image.open(io.BytesIO(res.content)).convert("RGBA")
-                    raw_av = raw_av.resize((size, size), Image.Resampling.LANCZOS)
-                    avatar_img.paste(raw_av, (0, 0), mask)
-                    return avatar_img
+            content = await _fetch_avatar_bytes(url)
+            if content:
+                raw_av = Image.open(io.BytesIO(content)).convert("RGBA")
+                raw_av = raw_av.resize((size, size), Image.Resampling.LANCZOS)
+                avatar_img.paste(raw_av, (0, 0), mask)
+                return avatar_img
         except Exception as e:
             logger.warning(f"Ошибка загрузки аватара ({url}): {e}")
 
@@ -159,7 +178,7 @@ async def make_challenge_card(
     font_title = _get_font(44, bold=True)
     font_sub = _get_font(24, bold=False)
     draw.text((width // 2, 60), "MOG BATTLE", font=font_title, fill=COLOR_GOLD, anchor="mm")
-    draw.text((width // 2, 110), "OPEN CHALLENGE", font=font_sub, fill=COLOR_GREY, anchor="mm")
+    draw.text((width // 2, 110), "OPEN CHALLENGE  \u00b7  @MOGGEDSTARSBOT", font=font_sub, fill=COLOR_GREY, anchor="mm")
 
     # Игрок 1 (Вызывающий)
     c1_x, c_y = 270, 240
@@ -200,7 +219,7 @@ async def make_challenge_card(
     draw.rounded_rectangle(b_box, radius=16, fill=(30, 41, 59, 200), outline=COLOR_BORDER, width=3)
     
     font_banner = _get_font(24, bold=True)
-    draw.text((width // 2, 735), "⚔️ КТО ГОТОВ ПРИНЯТЬ ВЫЗОВ?", font=font_banner, fill=COLOR_GOLD, anchor="mm")
+    draw.text((width // 2, 735), "КТО ГОТОВ ПРИНЯТЬ ВЫЗОВ?", font=font_banner, fill=COLOR_GOLD, anchor="mm")
 
     # Сохранение в BytesIO JPEG
     output = io.BytesIO()
@@ -242,7 +261,7 @@ async def make_result_card(
     """
     Генерация карточки результатов боя (1080x1220 px).
     """
-    width, height = 1080, 1220
+    width, height = 1080, 1110
     canvas = _create_background(width, height)
     draw = ImageDraw.Draw(canvas)
 
@@ -250,7 +269,7 @@ async def make_result_card(
     font_title = _get_font(44, bold=True)
     font_sub = _get_font(24, bold=False)
     draw.text((width // 2, 60), "MOG BATTLE", font=font_title, fill=COLOR_GOLD, anchor="mm")
-    draw.text((width // 2, 110), "RESULT", font=font_sub, fill=COLOR_GREY, anchor="mm")
+    draw.text((width // 2, 110), "RESULT  \u00b7  @MOGGEDSTARSBOT", font=font_sub, fill=COLOR_GREY, anchor="mm")
 
     # Расчет итогового счета
     p1_score = average_score(p1_stats)
@@ -385,6 +404,9 @@ async def make_result_card(
     draw.text((width // 2, info_y1 + 45), f"{p1_score:.2f}  VS  {p2_score:.2f}", font=font_bot, fill=COLOR_WHITE, anchor="mm")
     # Разница справа
     draw.text((990, info_y1 + 45), f"Difference +{diff:.2f}", font=font_bot, fill=COLOR_GOLD, anchor="rm")
+
+    draw.text((width // 2, 1035), "Сравни свой профиль", font=_get_font(22), fill=COLOR_GREY, anchor="mm")
+    draw.text((width // 2, 1068), "@MOGGEDSTARSBOT", font=_get_font(28, bold=True), fill=COLOR_PURPLE, anchor="mm")
 
     # Сохранение в BytesIO JPEG
     output = io.BytesIO()

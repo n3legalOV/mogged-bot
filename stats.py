@@ -105,9 +105,9 @@ def _username_score(username: Optional[str]) -> tuple[float, int]:
     score = max(0.5, score)
     return round(score, 2), length
 
-def _exp_score(battles: int, wins: int) -> float:
-    """Опыт в боте: чем больше батлов и побед, тем выше (реальные данные из БД)."""
-    return round(min(10.0, 2.0 + battles * 0.25 + wins * 0.15), 2)
+def _exp_score(battles: int, wins: int, invites: int = 0) -> float:
+    """Опыт в боте: батлы, победы и приглашённые друзья (реальные данные из БД)."""
+    return round(min(10.0, 2.0 + battles * 0.25 + wins * 0.15 + min(2.0, invites * 0.3)), 2)
 
 def _premium_score(has_premium: Optional[bool]) -> float:
     if has_premium is None:  # бот этого игрока ещё не видел — нейтрально
@@ -126,6 +126,7 @@ async def fetch_profile_stats(
     decor: int = 0,
     battles: int = 0,
     wins: int = 0,
+    invites: int = 0,
 ) -> ProfileStats:
     avatar_count = 0
     avatar_score = 0.0
@@ -159,7 +160,7 @@ async def fetch_profile_stats(
         gifts_score=round(gifts_score,2),
         value_score=value_score,
         reg_score=reg_sc,
-        level_score=_exp_score(battles, wins),
+        level_score=_exp_score(battles, wins, invites),
         avatar_count=avatar_count,
         username_len=u_len,
         has_premium=has_premium,
