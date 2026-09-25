@@ -1,14 +1,19 @@
+"""
+Карточки MOG BATTLE в стиле iOS (тёмная тема): сгруппированные карточки, системные цвета,
+капсулы-статусы, рендер в 2x и уменьшение для гладких краёв.
+"""
 import io
-import math
 import logging
-from typing import Optional, Union, List, Any
+import time
+from functools import lru_cache
+from typing import Any, List, Optional
+
 import httpx
 from PIL import Image, ImageDraw, ImageFont
 
-# Попытка импорта из существующего проекта, с фоллбэком при отсутствии
 try:
     from stats import Rank, average_score
-except ImportError:
+except ImportError:  # запуск отдельно от проекта
     class Rank:
         def __init__(self, name: str, color: str):
             self.name = name
@@ -19,66 +24,108 @@ except ImportError:
 
 logger = logging.getLogger(__name__)
 
-# ==========================================
-# ЦВЕТОВАЯ ПАЛИТРА И СТИЛИ
-# ==========================================
-BG_GRADIENT_TOP = (15, 23, 42)       # #0F172A
-BG_GRADIENT_BOTTOM = (30, 41, 59)    # #1E293B
-COLOR_WHITE = "#FFFFFF"
-COLOR_GREY = "#94A3B8"
-COLOR_GOLD = "#FFD700"
-COLOR_GREEN = "#22C55E"
-COLOR_RED = "#EF4444"
-COLOR_BORDER = "#334155"
-COLOR_PURPLE = "#8B5CF6"
+# ---------- палитра iOS (dark) ----------
+BG = "#000000"
+CARD = "#1C1C1E"
+CARD2 = "#2C2C2E"
+SEP = "#38383A"
+WHITE = "#FFFFFF"
+LABEL2 = "#8E8E93"
+FILL_OFF = "#48484A"
+GREEN = "#30D158"
+RED = "#FF453A"
+BLUE = "#0A84FF"
+ORANGE = "#FF9F0A"
+
+S = 2  # коэффициент суперсэмплинга
+
+_FONT_DIRS = {
+    False: ["/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
+            "C:/Windows/Fonts/segoeui.ttf", "C:/Windows/Fonts/arial.ttf",
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"],
+    True: ["/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",
+           "C:/Windows/Fonts/segoeuib.ttf", "C:/Windows/Fonts/arialbd.ttf",
+           "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"],
+}
 
 
-# ==========================================
-# ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ
-# ==========================================
-def _get_font(size: int, bold: bool = False) -> ImageFont.FreeTypeFont:
-    """Подбор доступного шрифта с поддержкой кириллицы."""
-    fonts_to_check = [
-        ("C:/Windows/Fonts/arialbd.ttf" if bold else "C:/Windows/Fonts/arial.ttf"),
-        ("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf" if bold else "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"),
-        ("/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf" if bold else "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf"),
-        ("System/Library/Fonts/Supplemental/Arial Bold.ttf" if bold else "System/Library/Fonts/Supplemental/Arial.ttf")
-    ]
-    
-    for path in fonts_to_check:
+@lru_cache(maxsize=64)
+def _font(size: int, bold: bool) -> ImageFont.FreeTypeFont:
+    for path in _FONT_DIRS[bold]:
         try:
             return ImageFont.truetype(path, size)
         except Exception:
             continue
-            
     return ImageFont.load_default()
 
 
-def _create_background(width: int, height: int) -> Image.Image:
-    """Генерация градиентного фона от #0F172A к #1E293B с рамкой."""
-    base = Image.new("RGB", (1, height))
-    for y in range(height):
-        ratio = y / height
-        r = int(BG_GRADIENT_TOP[0] + (BG_GRADIENT_BOTTOM[0] - BG_GRADIENT_TOP[0]) * ratio)
-        g = int(BG_GRADIENT_TOP[1] + (BG_GRADIENT_BOTTOM[1] - BG_GRADIENT_TOP[1]) * ratio)
-        b = int(BG_GRADIENT_TOP[2] + (BG_GRADIENT_BOTTOM[2] - BG_GRADIENT_TOP[2]) * ratio)
-        base.putpixel((0, y), (r, g, b))
-    
-    img = base.resize((width, height), Image.Resampling.BILINEAR).convert("RGBA")
-    draw = ImageDraw.Draw(img)
-    
-    # Внешняя скругленная обводка карточки
-    draw.rounded_rectangle((20, 20, width - 20, height - 20), radius=24, outline=COLOR_BORDER, width=3)
-    return img
+def _rgb(hex_color: str) -> tuple[int, int, int]:
+    h = hex_color.lstrip("#")
+    return int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16)
 
 
+def _mix(fg: str, bg: str, a: float) -> str:
+    f, b = _rgb(fg), _rgb(bg)
+    return "#%02x%02x%02x" % tuple(round(f[i] * a + b[i] * (1 - a)) for i in range(3))
+
+
+class Canvas:
+    """Рисует в координатах 1x, внутри держит картинку в 2x."""
+
+    def __init__(self, w: int, h: int, bg: str = BG):
+        self.w, self.h = w, h
+        self.img = Image.new("RGBA", (w * S, h * S), bg)
+        self.d = ImageDraw.Draw(self.img)
+
+    def rr(self, box, r, fill=None, outline=None, width=0):
+        x0, y0, x1, y1 = box
+        self.d.rounded_rectangle((x0 * S, y0 * S, x1 * S, y1 * S), radius=r * S,
+                                 fill=fill, outline=outline, width=width * S)
+
+    def circle(self, cx, cy, r, fill=None, outline=None, width=0):
+        self.d.ellipse(((cx - r) * S, (cy - r) * S, (cx + r) * S, (cy + r) * S),
+                       fill=fill, outline=outline, width=width * S)
+
+    def text(self, xy, s, size, fill=WHITE, bold=False, anchor="mm"):
+        self.d.text((xy[0] * S, xy[1] * S), s, font=_font(size * S, bold), fill=fill, anchor=anchor)
+
+    def width_of(self, s, size, bold=False) -> float:
+        return _font(size * S, bold).getlength(s) / S
+
+    def fit(self, s: str, max_w: int, size: int, bold=False) -> str:
+        if self.width_of(s, size, bold) <= max_w:
+            return s
+        while len(s) > 1 and self.width_of(s + "…", size, bold) > max_w:
+            s = s[:-1]
+        return s + "…"
+
+    def pill(self, cx, cy, s, size, fg, bg, padx=22, h=None, bold=True):
+        w = self.width_of(s, size, bold) + padx * 2
+        h = h or size + 20
+        self.rr((cx - w / 2, cy - h / 2, cx + w / 2, cy + h / 2), h / 2, fill=bg)
+        self.text((cx, cy), s, size, fill=fg, bold=bold)
+
+    def avatar(self, img: Image.Image, cx, cy, size):
+        self.img.alpha_composite(img, (int((cx - size / 2) * S), int((cy - size / 2) * S)))
+
+    def line(self, x0, x1, y, fill=SEP, width=1):
+        self.d.line((x0 * S, y * S, x1 * S, y * S), fill=fill, width=width * S)
+
+    def to_jpeg(self, quality: int = 93) -> io.BytesIO:
+        out = io.BytesIO()
+        self.img.resize((self.w, self.h), Image.Resampling.LANCZOS).convert("RGB").save(
+            out, format="JPEG", quality=quality, subsampling=0)
+        out.seek(0)
+        return out
+
+
+# ---------- аватарки ----------
 _AV_CACHE: dict[str, tuple[float, bytes]] = {}
 _AV_TTL = 1800
 _AV_MAX = 300
 
 
 async def _fetch_avatar_bytes(url: str) -> Optional[bytes]:
-    import time
     hit = _AV_CACHE.get(url)
     if hit and time.monotonic() - hit[0] < _AV_TTL:
         return hit[1]
@@ -92,342 +139,160 @@ async def _fetch_avatar_bytes(url: str) -> Optional[bytes]:
     return res.content
 
 
-async def _fetch_avatar(url: Optional[str], size: int) -> Image.Image:
-    """Загрузка аватара или создание заменяющей заглушки с знакам '?'."""
-    avatar_img = Image.new("RGBA", (size, size), (0, 0, 0, 0))
-    mask = Image.new("L", (size, size), 0)
-    mask_draw = ImageDraw.Draw(mask)
-    mask_draw.ellipse((0, 0, size, size), fill=255)
-
+async def _fetch_avatar(url: Optional[str], px: int, placeholder: str = "?") -> Image.Image:
+    """Круглая аватарка px×px (в 2x-пикселях) или серый круг с символом."""
+    out = Image.new("RGBA", (px, px), (0, 0, 0, 0))
+    mask = Image.new("L", (px, px), 0)
+    ImageDraw.Draw(mask).ellipse((0, 0, px - 1, px - 1), fill=255)
     if url:
         try:
             content = await _fetch_avatar_bytes(url)
             if content:
-                raw_av = Image.open(io.BytesIO(content)).convert("RGBA")
-                raw_av = raw_av.resize((size, size), Image.Resampling.LANCZOS)
-                avatar_img.paste(raw_av, (0, 0), mask)
-                return avatar_img
+                raw = Image.open(io.BytesIO(content)).convert("RGBA").resize((px, px), Image.Resampling.LANCZOS)
+                out.paste(raw, (0, 0), mask)
+                return out
         except Exception as e:
-            logger.warning(f"Ошибка загрузки аватара ({url}): {e}")
-
-    # Заглушка, если нет аватара
-    draw = ImageDraw.Draw(avatar_img)
-    draw.ellipse((0, 0, size - 1, size - 1), fill=(30, 41, 59, 255))
-    font_q = _get_font(int(size * 0.45), bold=True)
-    draw.text((size // 2, size // 2), "?", font=font_q, fill=COLOR_GREY, anchor="mm")
-    avatar_img.putalpha(mask)
-    return avatar_img
+            logger.warning("Ошибка загрузки аватара: %s", e)
+    d = ImageDraw.Draw(out)
+    d.ellipse((0, 0, px - 1, px - 1), fill=_rgb(CARD2))
+    d.text((px // 2, px // 2), placeholder, font=_font(int(px * 0.42), True), fill=_rgb(LABEL2), anchor="mm")
+    out.putalpha(mask)
+    return out
 
 
-def _draw_rank_badge(draw: ImageDraw.ImageDraw, x: int, y: int, rank_obj: Any, anchor: str = "mm"):
-    """Отрисовка плашки ранга."""
-    rank_name = getattr(rank_obj, 'name', str(rank_obj)).upper()
-    rank_color = getattr(rank_obj, 'color', "#3B82F6")
-    
-    font = _get_font(15, bold=True)
-    bbox = font.getbbox(rank_name)
-    tw = bbox[2] - bbox[0]
-    th = bbox[3] - bbox[1]
-    
-    pad_x, pad_y = 12, 5
-    bw, bh = tw + pad_x * 2, th + pad_y * 2
-
-    if anchor == "mm":
-        rx = x - bw // 2
-        ry = y - bh // 2
-    elif anchor == "lt":
-        rx, ry = x, y
-    else:
-        rx, ry = x - bw, y
-
-    draw.rounded_rectangle((rx, ry, rx + bw, ry + bh), radius=8, fill=rank_color)
-    draw.text((rx + bw // 2, ry + bh // 2), rank_name, font=font, fill=COLOR_WHITE, anchor="mm")
-
-
-def _create_mogged_stamp() -> Image.Image:
-    """Создание штампа MOGGED для проигравшей стороны."""
-    sw, sh = 280, 80
-    stamp = Image.new("RGBA", (sw, sh), (0, 0, 0, 0))
-    draw = ImageDraw.Draw(stamp)
-    
-    # Прямоугольная рамка
-    draw.rounded_rectangle((4, 4, sw - 4, sh - 4), radius=12, fill=(239, 68, 68, 40), outline=COLOR_RED, width=5)
-    font = _get_font(34, bold=True)
-    draw.text((sw // 2, sh // 2), "MOGGED", font=font, fill=COLOR_RED, anchor="mm")
-    
-    # Поворот штампа
-    return stamp.rotate(-14, expand=True, resample=Image.Resampling.BICUBIC)
+def _rank_pill(cv: Canvas, cx, cy, rank: Any, size: int = 22):
+    name = str(getattr(rank, "name", rank)).upper()
+    color = getattr(rank, "color", BLUE)
+    cv.pill(cx, cy, name, size, fg=WHITE, bg=color, padx=18, h=size + 16)
 
 
 # ==========================================
-# 1. КАРТОЧКА ВЫЗОВА (CHALLENGE CARD)
+# 1. КАРТОЧКА ВЫЗОВА
 # ==========================================
-async def make_challenge_card(
-    challenger_name: str,
-    photo_url: Optional[str],
-    rank: Any
-) -> io.BytesIO:
-    """
-    Генерация карточки открытого вызова (1080x800 px).
-    """
-    width, height = 1080, 800
-    canvas = _create_background(width, height)
-    draw = ImageDraw.Draw(canvas)
+async def make_challenge_card(challenger_name: str, photo_url: Optional[str], rank: Any) -> io.BytesIO:
+    W, H = 1080, 720
+    cv = Canvas(W, H)
+    cv.rr((40, 40, W - 40, H - 40), 44, fill=CARD)
 
-    # Заголовок
-    font_title = _get_font(44, bold=True)
-    font_sub = _get_font(24, bold=False)
-    draw.text((width // 2, 60), "MOG BATTLE", font=font_title, fill=COLOR_GOLD, anchor="mm")
-    draw.text((width // 2, 110), "OPEN CHALLENGE  \u00b7  @MOGGEDSTARSBOT", font=font_sub, fill=COLOR_GREY, anchor="mm")
+    cv.text((W / 2, 112), "MOG BATTLE", 26, fill=LABEL2, bold=True)
+    cv.text((W / 2, 170), "Открытый вызов", 54, bold=True)
 
-    # Игрок 1 (Вызывающий)
-    c1_x, c_y = 270, 240
-    av_size = 200
-    
-    # Аватар Вызывающего
-    av1 = await _fetch_avatar(photo_url, av_size)
-    draw.ellipse((c1_x - av_size // 2 - 4, c_y - av_size // 2 - 4, c1_x + av_size // 2 + 4, c_y + av_size // 2 + 4), outline=COLOR_GREEN, width=6)
-    canvas.paste(av1, (c1_x - av_size // 2, c_y - av_size // 2), av1)
-    
-    # Подписи Вызывающего
-    clean_name = challenger_name if challenger_name else "ИГРОК"
-    username_str = f"@{clean_name.lower().replace(' ', '_')}"
-    
-    font_name = _get_font(26, bold=True)
-    font_user = _get_font(18, bold=False)
-    
-    draw.text((c1_x, 380), clean_name[:16].upper(), font=font_name, fill=COLOR_WHITE, anchor="mm")
-    draw.text((c1_x, 420), username_str[:20], font=font_user, fill=COLOR_GREY, anchor="mm")
-    _draw_rank_badge(draw, c1_x, 465, rank, anchor="mm")
+    cy, r = 385, 100
+    left_x, right_x = 300, 780
+    av = await _fetch_avatar(photo_url, r * 2 * S, "•")
+    cv.circle(left_x, cy, r + 9, outline=GREEN, width=5)
+    cv.avatar(av, left_x, cy, r * 2)
 
-    # VS по центру
-    font_vs = _get_font(56, bold=True)
-    draw.text((width // 2, c_y), "VS", font=font_vs, fill=COLOR_WHITE, anchor="mm")
+    cv.circle(right_x, cy, r + 9, outline=SEP, width=4)
+    cv.avatar(await _fetch_avatar(None, r * 2 * S, "?"), right_x, cy, r * 2)
 
-    # Игрок 2 (Заглушка)
-    c2_x = 810
-    av2 = await _fetch_avatar(None, av_size)
-    draw.ellipse((c2_x - av_size // 2 - 4, c_y - av_size // 2 - 4, c2_x + av_size // 2 + 4, c_y + av_size // 2 + 4), outline=COLOR_PURPLE, width=6)
-    canvas.paste(av2, (c2_x - av_size // 2, c_y - av_size // 2), av2)
+    cv.text((W / 2, cy), "VS", 34, fill=LABEL2, bold=True)
 
-    font_sub_opp = _get_font(16, bold=False)
-    draw.text((c2_x, 380), "ЛЮБОЙ ИГРОК", font=font_name, fill=COLOR_WHITE, anchor="mm")
-    draw.text((c2_x, 420), "ПЕРВЫЙ НАЖАВШИЙ ПРИМЕТ БАТТЛ", font=font_sub_opp, fill=COLOR_GREY, anchor="mm")
+    name = challenger_name or "Игрок"
+    cv.text((left_x, 528), cv.fit(name, 380, 36, True), 36, bold=True)
+    _rank_pill(cv, left_x, 578, rank)
+    cv.text((right_x, 528), "Любой игрок", 36, bold=True)
+    cv.text((right_x, 578), "первый нажавший", 24, fill=LABEL2)
 
-    # Нижняя плашка
-    b_box = (80, 700, 1000, 770)
-    draw.rounded_rectangle(b_box, radius=16, fill=(30, 41, 59, 200), outline=COLOR_BORDER, width=3)
-    
-    font_banner = _get_font(24, bold=True)
-    draw.text((width // 2, 735), "КТО ГОТОВ ПРИНЯТЬ ВЫЗОВ?", font=font_banner, fill=COLOR_GOLD, anchor="mm")
-
-    # Сохранение в BytesIO JPEG
-    output = io.BytesIO()
-    canvas.convert("RGB").save(output, format="JPEG", quality=95)
-    output.seek(0)
-    return output
+    cv.pill(W / 2, 646, "@MOGGEDSTARSBOT", 24, fg=BLUE, bg=_mix(BLUE, CARD, 0.16), padx=26, h=48)
+    return cv.to_jpeg()
 
 
 # ==========================================
-# 2. КАРТОЧКА РЕЗУЛЬТАТА (RESULT CARD)
+# 2. КАРТОЧКА РЕЗУЛЬТАТА
 # ==========================================
+ROW_LABELS = ["Аватар", "Ник", "О себе", "Premium", "Оформление", "Дата рег.", "Опыт"]
+
+
 async def make_result_card(
-    p1_name: str,
-    p1_photo: Optional[str],
-    p1_rank: Any,
-    p1_stats: List[float],
-    p2_name: str,
-    p2_photo: Optional[str],
-    p2_rank: Any,
-    p2_stats: List[float],
-    p1_avatar_count: int = 1,
-    p1_username_len: Optional[int] = None,
-    p1_bio: Optional[str] = None,
-    p1_gifts: int = 0,
-    p1_nft: int = 0,
+    p1_name: str, p1_photo: Optional[str], p1_rank: Any, p1_stats: List[float],
+    p2_name: str, p2_photo: Optional[str], p2_rank: Any, p2_stats: List[float],
+    p1_avatar_count: int = 1, p1_username_len: Optional[int] = None, p1_bio: Optional[str] = None,
     p1_value: Optional[float] = None,
-    p1_reg_date: Optional[str] = None,
-    p1_tg_level: int = 1,
-    p2_avatar_count: int = 1,
-    p2_username_len: Optional[int] = None,
-    p2_bio: Optional[str] = None,
-    p2_gifts: int = 0,
-    p2_nft: int = 0,
+    p2_avatar_count: int = 1, p2_username_len: Optional[int] = None, p2_bio: Optional[str] = None,
     p2_value: Optional[float] = None,
-    p2_reg_date: Optional[str] = None,
-    p2_tg_level: int = 1,
-    **kwargs
+    **kwargs,
 ) -> io.BytesIO:
-    """
-    Генерация карточки результатов боя (1080x1220 px).
-    """
-    width, height = 1080, 1110
-    canvas = _create_background(width, height)
-    draw = ImageDraw.Draw(canvas)
-
-    # Заголовок
-    font_title = _get_font(44, bold=True)
-    font_sub = _get_font(24, bold=False)
-    draw.text((width // 2, 60), "MOG BATTLE", font=font_title, fill=COLOR_GOLD, anchor="mm")
-    draw.text((width // 2, 110), "RESULT  \u00b7  @MOGGEDSTARSBOT", font=font_sub, fill=COLOR_GREY, anchor="mm")
-
-    # Расчет итогового счета
-    p1_score = average_score(p1_stats)
-    p2_score = average_score(p2_stats)
-    p1_wins = p1_score >= p2_score
+    W, H = 1080, 1490
+    cv = Canvas(W, H)
     is_draw = bool(kwargs.get("is_draw"))
+    s1, s2 = average_score(p1_stats), average_score(p2_stats)
+    p1_wins = s1 >= s2
 
-    # Данные колонок
-    players_data = [
-        {
-            "x": 60, "name": p1_name, "photo": p1_photo, "rank": p1_rank, "stats": p1_stats,
-            "score": p1_score, "is_winner": p1_wins,
-            "subtexts": [
-                f"{p1_avatar_count} фото",
-                f"{p1_username_len or len(p1_name)} букв",
-                p1_bio if p1_bio else "пусто",
-                {True: "есть", False: "нет"}.get(kwargs.get("p1_premium"), "неизвестно"),
-                f"{int(p1_value or 0)} из 4",
-                f"≈{kwargs.get('p1_reg_year') or '?'}",
-                f"{kwargs.get('p1_battles') or 0} батлов"
-            ]
-        },
-        {
-            "x": 580, "name": p2_name, "photo": p2_photo, "rank": p2_rank, "stats": p2_stats,
-            "score": p2_score, "is_winner": not p1_wins,
-            "subtexts": [
-                f"{p2_avatar_count} фото",
-                f"{p2_username_len or len(p2_name)} букв",
-                p2_bio if p2_bio else "пусто",
-                {True: "есть", False: "нет"}.get(kwargs.get("p2_premium"), "неизвестно"),
-                f"{int(p2_value or 0)} из 4",
-                f"≈{kwargs.get('p2_reg_year') or '?'}",
-                f"{kwargs.get('p2_battles') or 0} батлов"
-            ]
-        }
+    cv.text((W / 2, 74), "MOG BATTLE", 26, fill=LABEL2, bold=True)
+    cv.text((W / 2, 122), "Результат батла", 44, bold=True)
+
+    # --- шапка: два игрока ---
+    cv.rr((40, 170, W - 40, 690), 44, fill=CARD)
+    cv.text((W / 2, 352), "VS", 30, fill=LABEL2, bold=True)
+    players = [
+        (290, p1_name, p1_photo, p1_rank, s1, p1_wins),
+        (790, p2_name, p2_photo, p2_rank, s2, not p1_wins),
     ]
+    for cx, name, photo, rank, score, is_win in players:
+        color = BLUE if is_draw else (GREEN if is_win else RED)
+        r = 84
+        cv.circle(cx, 300, r + 9, outline=color, width=5)
+        cv.avatar(await _fetch_avatar(photo, r * 2 * S, "?"), cx, 300, r * 2)
+        cv.text((cx, 432), cv.fit(name or "Игрок", 420, 34, True), 34, bold=True)
+        _rank_pill(cv, cx, 482, rank, 20)
+        cv.text((cx, 566), f"{score:.2f}", 76, fill=WHITE if (is_win or is_draw) else LABEL2, bold=True)
+        status = "Ничья" if is_draw else ("Победа" if is_win else "Поражение")
+        cv.pill(cx, 636, status, 24, fg=color, bg=_mix(color, CARD, 0.18), padx=26, h=48)
 
-    col_w, col_h = 440, 700
-    col_y = 160
+    # --- сравнение по параметрам ---
+    top, row_h = 720, 88
+    cv.rr((40, top, W - 40, top + 7 * row_h + 32), 44, fill=CARD)
 
-    # Разделитель VS между колонками
-    font_vs = _get_font(28, bold=True)
-    draw.text((width // 2, col_y + col_h // 2 - 20), "VS", font=font_vs, fill=COLOR_WHITE, anchor="mm")
+    def subs(n: str, avatars, ulen, bio, name, value) -> List[str]:
+        prem = {True: "есть", False: "нет"}.get(kwargs.get(f"{n}_premium"), "неизвестно")
+        return [f"{avatars} фото", f"{ulen or len(name or '')} букв", (bio or "пусто")[:16],
+                prem, f"{int(value or 0)} из 4", f"≈{kwargs.get(f'{n}_reg_year') or '?'}",
+                f"{kwargs.get(f'{n}_battles') or 0} батлов"]
 
-    param_names = ["Аватар", "@username", "О себе", "Premium", "Оформление", "Дата рег.", "Опыт в боте"]
+    sub1 = subs("p1", p1_avatar_count, p1_username_len, p1_bio, p1_name, p1_value)
+    sub2 = subs("p2", p2_avatar_count, p2_username_len, p2_bio, p2_name, p2_value)
+    bar_max, left_edge, right_edge = 330, 440, 640
 
-    for p in players_data:
-        px = p["x"]
-        is_win = p["is_winner"]
-        stroke_color = COLOR_GREY if is_draw else (COLOR_GREEN if is_win else COLOR_RED)
+    for i in range(7):
+        y = top + 16 + i * row_h
+        cy = y + row_h / 2
+        if i:
+            cv.line(90, W - 90, y, SEP)
+        v1, v2 = p1_stats[i], p2_stats[i]
+        c1 = BLUE if v1 == v2 else (GREEN if v1 > v2 else FILL_OFF)
+        c2 = BLUE if v1 == v2 else (GREEN if v2 > v1 else FILL_OFF)
 
-        # Фон колонки
-        draw.rounded_rectangle((px, col_y, px + col_w, col_y + col_h), radius=20, fill=(15, 23, 42, 230), outline=stroke_color, width=4)
+        cv.text((W / 2, cy - 6), ROW_LABELS[i], 24, fill=WHITE, bold=True)
+        for side, v, col, sub in ((-1, v1, c1, sub1[i]), (1, v2, c2, sub2[i])):
+            edge = left_edge if side < 0 else right_edge
+            anchor = "rm" if side < 0 else "lm"
+            strong = col in (GREEN, BLUE)
+            cv.text((edge, cy - 24), f"{v:.1f}", 32, fill=WHITE if strong else LABEL2, bold=True, anchor=anchor)
+            bx0, bx1 = (edge - bar_max, edge) if side < 0 else (edge, edge + bar_max)
+            cv.rr((bx0, cy + 2, bx1, cy + 12), 5, fill=CARD2)
+            fill_w = max(10, int(bar_max * min(max(v, 0.0) / 10.0, 1.0)))
+            if side < 0:
+                cv.rr((edge - fill_w, cy + 2, edge, cy + 12), 5, fill=col)
+            else:
+                cv.rr((edge, cy + 2, edge + fill_w, cy + 12), 5, fill=col)
+            cv.text((edge, cy + 30), sub, 18, fill=LABEL2, anchor=anchor)
 
-        # Аватар 120x120
-        av_img = await _fetch_avatar(p["photo"], 120)
-        draw.ellipse((px + 18, col_y + 18, px + 142, col_y + 142), outline=stroke_color, width=4)
-        canvas.paste(av_img, (px + 20, col_y + 20), av_img)
-
-        # Имя, юзернейм, ранг
-        font_pname = _get_font(22, bold=True)
-        font_puser = _get_font(16, bold=False)
-        clean_pname = p["name"] if p["name"] else "Игрок"
-        
-        draw.text((px + 160, col_y + 25), clean_pname[:14].upper(), font=font_pname, fill=COLOR_WHITE, anchor="lt")
-        draw.text((px + 160, col_y + 60), f"@{clean_pname.lower().replace(' ', '_')[:16]}", font=font_puser, fill=COLOR_GREY, anchor="lt")
-        _draw_rank_badge(draw, px + 160, col_y + 95, p["rank"], anchor="lt")
-
-        # Итоговый счет игрока
-        font_pscore = _get_font(38, bold=True)
-        draw.text((px + col_w - 20, col_y + 30), f"{p['score']:.2f}", font=font_pscore, fill=stroke_color, anchor="rt")
-
-        # Статус плашка (WINNER / MOGGED)
-        status_text = "DRAW" if is_draw else ("WINNER" if is_win else "MOGGED")
-        draw.rounded_rectangle((px + 20, col_y + 155, px + 160, col_y + 187), radius=8, fill=stroke_color)
-        font_status = _get_font(16, bold=True)
-        draw.text((px + 90, col_y + 171), status_text, font=font_status, fill=COLOR_WHITE, anchor="mm")
-
-        # Таблица параметров (7 строк)
-        row_start_y = col_y + 215
-        row_h = 65
-
-        font_lbl = _get_font(14, bold=False)
-        font_sub_lbl = _get_font(11, bold=False)
-        font_val = _get_font(14, bold=True)
-
-        for i in range(7):
-            ry = row_start_y + i * row_h
-            val = p["stats"][i] if i < len(p["stats"]) else 0.0
-            sub_txt = p["subtexts"][i]
-
-            # Название и подтекст
-            draw.text((px + 20, ry), param_names[i], font=font_lbl, fill=COLOR_WHITE, anchor="lt")
-            draw.text((px + 20, ry + 18), str(sub_txt)[:18], font=font_sub_lbl, fill=COLOR_GREY, anchor="lt")
-
-            # Шкала прогресса
-            bar_x = px + 150
-            bar_w = 200
-            bar_y = ry + 8
-            
-            draw.rounded_rectangle((bar_x, bar_y, bar_x + bar_w, bar_y + 8), radius=4, fill=(30, 41, 59, 255))
-            
-            fill_w = int(bar_w * min(max(val, 0.0) / 10.0, 1.0))
-            if fill_w > 0:
-                draw.rounded_rectangle((bar_x, bar_y, bar_x + fill_w, bar_y + 8), radius=4, fill=stroke_color)
-
-            # Числовое значение
-            draw.text((px + col_w - 20, ry + 2), f"{val:.2f}", font=font_val, fill=COLOR_WHITE, anchor="rt")
-
-        # Штамп MOGGED поверх проигравшего
-        if not is_win and not is_draw:
-            stamp = _create_mogged_stamp()
-            canvas.paste(stamp, (px + 100, col_y + 360), stamp)
-
-    # Нижняя плашка
-    info_y1 = col_y + col_h + 30
-    info_y2 = info_y1 + 90
-    draw.rounded_rectangle((60, info_y1, 1020, info_y2), radius=16, fill=(15, 23, 42, 255), outline=COLOR_BORDER, width=3)
-
-    winner_player = players_data[0] if p1_wins else players_data[1]
-    winner_username = f"@{winner_player['name'].lower().replace(' ', '_')}"
-    diff = abs(p1_score - p2_score)
-
-    font_bot = _get_font(24, bold=True)
-    
-    # Победитель слева
-    if is_draw:
-        draw.text((90, info_y1 + 45), "DRAW", font=font_bot, fill=COLOR_GREY, anchor="lm")
-    else:
-        draw.text((90, info_y1 + 45), f"WINNER {winner_username[:16]}", font=font_bot, fill=COLOR_GREEN, anchor="lm")
-    # Счет по центру
-    draw.text((width // 2, info_y1 + 45), f"{p1_score:.2f}  VS  {p2_score:.2f}", font=font_bot, fill=COLOR_WHITE, anchor="mm")
-    # Разница справа
-    draw.text((990, info_y1 + 45), f"Difference +{diff:.2f}", font=font_bot, fill=COLOR_GOLD, anchor="rm")
-
-    draw.text((width // 2, 1035), "Сравни свой профиль", font=_get_font(22), fill=COLOR_GREY, anchor="mm")
-    draw.text((width // 2, 1068), "@MOGGEDSTARSBOT", font=_get_font(28, bold=True), fill=COLOR_PURPLE, anchor="mm")
-
-    # Сохранение в BytesIO JPEG
-    output = io.BytesIO()
-    canvas.convert("RGB").save(output, format="JPEG", quality=95)
-    output.seek(0)
-    return output
-
+    # --- подпись: карточку пересылают, это и есть реклама ---
+    cv.text((W / 2, 1418), "Сравни свой профиль", 22, fill=LABEL2)
+    cv.pill(W / 2, 1452, "@MOGGEDSTARSBOT", 24, fg=BLUE, bg=_mix(BLUE, BG, 0.16), padx=26, h=44)
+    return cv.to_jpeg()
 
 
 # ==========================================
 # 3. ФИРМЕННАЯ КАРТОЧКА (заглушка для inline)
 # ==========================================
 def make_brand_card() -> io.BytesIO:
-    width, height = 1080, 800
-    canvas = _create_background(width, height)
-    draw = ImageDraw.Draw(canvas)
-    draw.text((width // 2, 300), "MOG BATTLE", font=_get_font(96, bold=True), fill=COLOR_GOLD, anchor="mm")
-    draw.text((width // 2, 400), "ОТКРЫТЫЙ ВЫЗОВ", font=_get_font(40), fill=COLOR_WHITE, anchor="mm")
-    draw.text((width // 2, 520), "Кто круче — проверим профили", font=_get_font(30), fill=COLOR_GREY, anchor="mm")
-    draw.text((width // 2, 700), "@MOGGEDSTARSBOT", font=_get_font(34, bold=True), fill=COLOR_PURPLE, anchor="mm")
-    output = io.BytesIO()
-    canvas.convert("RGB").save(output, format="JPEG", quality=92)
-    output.seek(0)
-    return output
+    W, H = 1080, 720
+    cv = Canvas(W, H)
+    cv.rr((40, 40, W - 40, H - 40), 44, fill=CARD)
+    cv.text((W / 2, 250), "MOG BATTLE", 104, bold=True)
+    cv.text((W / 2, 360), "Открытый вызов", 46, fill=WHITE, bold=True)
+    cv.text((W / 2, 430), "Кто круче — проверим профили", 30, fill=LABEL2)
+    cv.pill(W / 2, 560, "@MOGGEDSTARSBOT", 30, fg=BLUE, bg=_mix(BLUE, CARD, 0.16), padx=34, h=60)
+    return cv.to_jpeg()
