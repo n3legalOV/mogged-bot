@@ -13,6 +13,7 @@ import random
 import time
 import uuid
 from io import BytesIO
+from typing import NamedTuple
 from types import SimpleNamespace
 from urllib.parse import quote
 
@@ -40,7 +41,8 @@ from dotenv import load_dotenv
 
 import database as db
 import image_generator as ig
-from stats import Rank, roll_battle, fetch_profile_stats, average_score, get_rank, get_score_rank
+from aiogram.types import BotCommand
+from stats import roll_battle, fetch_profile_stats, average_score, get_rank, get_score_rank
 
 load_dotenv()
 
@@ -93,9 +95,9 @@ def display(username: str | None, first_name: str | None, uid: int) -> str:
     return f"<b>{html.escape(first_name or str(uid))}</b>"
 
 
-def share_url(user_id: int | None = None) -> str:
+def share_url(user_id: int | None = None, text: str | None = None) -> str:
     link = BOT_LINK + (f"?start=ref_{user_id}" if user_id else "")
-    text = "Кто круче — проверим профили. MOG BATTLE"
+    text = text or "Кто круче — проверим профили. MOG BATTLE"
     return f"https://t.me/share/url?url={quote(link, safe='')}&text={quote(text)}"
 
 
@@ -165,12 +167,14 @@ def main_menu_kb(user_id: int) -> InlineKeyboardMarkup:
     ])
 
 
-def result_kb(battle_id: int, rematch: bool = True) -> InlineKeyboardMarkup:
-    rows = []
+def result_kb(battle_id: int, rematch: bool = True, share_text: str | None = None) -> InlineKeyboardMarkup:
+    first = []
     if rematch:
-        rows.append([InlineKeyboardButton(text="Реванш (1 раз)", callback_data=f"rm:{battle_id}")])
-    rows.append([InlineKeyboardButton(text="Новый вызов", switch_inline_query="mogg"),
-                 InlineKeyboardButton(text="Поделиться", url=share_url())])
+        first.append(InlineKeyboardButton(text="Реванш (1 раз)", callback_data=f"rm:{battle_id}"))
+    first.append(InlineKeyboardButton(text="Как считается", callback_data="how"))
+    rows = [first,
+            [InlineKeyboardButton(text="Новый вызов", switch_inline_query="mogg"),
+             InlineKeyboardButton(text="Поделиться результатом", url=share_url(text=share_text))]]
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
@@ -196,6 +200,20 @@ WELCOME = (
     "Быстрый вызов в любом чате: <code>@MOGGEDSTARSBOT mogg</code>\n"
     "В группе: ответь на сообщение командой /duel\n\n"
     "/me · /topmog · /week · /history · /invite"
+)
+
+
+HOW_SHORT = ("7 параметров с весами: ник, Premium и возраст аккаунта весят больше. "
+             "К счёту добавляется «форма дня» ±0.8, поэтому бывают апсеты. Разница меньше 0.15 — ничья.")
+
+HOW_FULL = (
+    "<b>Как считается батл</b>\n\n"
+    "У каждого 7 оценок от 0 до 10: аватар, ник, био, Premium, оформление профиля, дата регистрации и опыт в боте.\n"
+    "Итог — среднее с весами: ник ×1.3, Premium и возраст аккаунта ×1.2, аватар ×1.0, био и оформление ×0.8, опыт ×0.7.\n\n"
+    "К оценкам каждого добавляется «форма дня» — случайный сдвиг до ±0.8. Поэтому слабый профиль иногда обыгрывает "
+    "сильного (это называется апсет), а результат нельзя предсказать заранее.\n"
+    "Если счёт различается меньше чем на 0.15 — ничья.\n\n"
+    "<i>Дата регистрации оценивается по ID аккаунта, Premium бот узнаёт, когда игрок сам что-то ему пишет.</i>"
 )
 
 
@@ -252,7 +270,14 @@ def build_week_text() -> str | None:
 
 
 # ---------- ЯДРО БАТЛА ----------
-async def play_battle(bot: Bot, p1_id: int, p2_id: int, rematch: bool = False) -> tuple[BytesIO, str, int]:
+class BattleResult(NamedTuple):
+    card: BytesIO
+    caption: str
+    battle_id: int
+    share_text: str
+
+
+async def play_battle(bot: Bot, p1_id: int, p2_id: int, rematch: bool = False) -> BattleResult:
     """Считает батл двух игроков, пишет результат в БД, возвращает (карточка, подпись, id батла)."""
     if db.pair_battles_recent(p1_id, p2_id, PAIR_WINDOW) >= PAIR_LIMIT:
         raise BattleLimit
@@ -282,7 +307,8 @@ async def play_battle(bot: Bot, p1_id: int, p2_id: int, rematch: bool = False) -
 
     p1_stats = await stats_of(p1_id, p1_chat)
     p2_stats = await stats_of(p2_id, p2_chat)
-    p1_list, p2_list, outcome = roll_battle(p1_stats.to_list(), p2_stats.to_list())
+    roll = roll_battle(p1_stats.to_list(), p2_stats.to_list())
+    p1_list, p2_list, outcome = roll.a, roll.b, roll.outcome
     p1_score, p2_score = average_score(p1_list), average_score(p2_list)
     is_draw = outcome == "draw"
     p1_wins = outcome != "p2"
@@ -297,6 +323,8 @@ async def play_battle(bot: Bot, p1_id: int, p2_id: int, rematch: bool = False) -
     p1_row, p2_row = db.get_player(p1_id), db.get_player(p2_id)
     p1_rank, p2_rank = get_rank(p1_row["wins"]), get_rank(p2_row["wins"])
     extra = []
+    if roll.upset:
+        extra.append(f"<b>Апсет</b>: {p1_html if p1_wins else p2_html} обыграл более сильный профиль")
     if not is_draw:
         w_id, w_row, w_html = (p1_id, p1_row, p1_html) if p1_wins else (p2_id, p2_row, p2_html)
         new_rank = get_rank(w_row["wins"]).name
@@ -304,6 +332,7 @@ async def play_battle(bot: Bot, p1_id: int, p2_id: int, rematch: bool = False) -
             extra.append(f"Новый ранг: <b>{new_rank}</b> — {w_html}")
         if (w_row["streak"] or 0) >= 3:
             extra.append(f"Серия побед: <b>{w_row['streak']}</b> — {w_html}")
+    extra.append(f"<i>Форма дня: {p1_html} {roll.form1:+.1f} · {p2_html} {roll.form2:+.1f}</i>")
 
     p1_photo = await get_photo_url(bot, p1_id)
     p2_photo = await get_photo_url(bot, p2_id)
@@ -320,12 +349,17 @@ async def play_battle(bot: Bot, p1_id: int, p2_id: int, rematch: bool = False) -
         p2_avatar_count=p2_stats.avatar_count, p2_username_len=p2_stats.username_len,
         p2_premium=p2_stats.has_premium, p2_reg_year=p2_stats.reg_year,
         p2_value=p2_stats.profile_value, p2_bio=bio(p2_chat), p2_battles=p2_row["total_battles"],
-        is_draw=is_draw,
+        is_draw=is_draw, upset=roll.upset,
     )
     winner, loser = (p1_html, p2_html) if p1_wins else (p2_html, p1_html)
     caption = build_result_text(winner, loser, p1_score, p2_score, p1_list, p2_list,
                                 draw=is_draw, extra="\n".join(extra))
-    return card, caption, battle_id
+    wn, ln = (p1_name, p2_name) if p1_wins else (p2_name, p1_name)
+    if is_draw:
+        share_text = f"{wn} и {ln}: ничья {p1_score:.2f}:{p2_score:.2f}"
+    else:
+        share_text = f"{wn} MOGGED {ln} {max(p1_score, p2_score):.2f}:{min(p1_score, p2_score):.2f}"
+    return BattleResult(card, caption, battle_id, share_text + " в MOG BATTLE. А ты сможешь?")
 
 
 async def play_spar(bot: Bot, user_id: int) -> tuple[BytesIO, str]:
@@ -339,7 +373,8 @@ async def play_spar(bot: Bot, user_id: int) -> tuple[BytesIO, str]:
         battles=row["total_battles"] if row else 0, wins=row["wins"] if row else 0,
         invites=(row["invites"] or 0) if row else 0)
     npc_name, npc_stats = random.choice(NPCS)
-    my_list, npc_list, outcome = roll_battle(me.to_list(), list(npc_stats))
+    roll = roll_battle(me.to_list(), list(npc_stats))
+    my_list, npc_list, outcome = roll.a, roll.b, roll.outcome
     s1, s2 = average_score(my_list), average_score(npc_list)
     is_draw, i_win = outcome == "draw", outcome == "p1"
     name = chat.username or chat.first_name or str(user_id)
@@ -501,6 +536,16 @@ async def cmd_history(msg: Message) -> None:
     await msg.answer("\n".join(lines))
 
 
+@router.message(Command("how"))
+async def cmd_how(msg: Message) -> None:
+    await msg.answer(HOW_FULL)
+
+
+@router.callback_query(F.data == "how")
+async def cb_how(call: CallbackQuery) -> None:
+    await call.answer(HOW_SHORT, show_alert=True)
+
+
 @router.message(Command("hide"))
 async def cmd_hide(msg: Message) -> None:
     hidden = db.toggle_hidden(msg.from_user.id)
@@ -577,7 +622,7 @@ async def duel_and_reply(msg: Message, bot: Bot, target_id: int) -> None:
         await msg.answer("Нельзя сразиться с самим собой.")
         return
     try:
-        card, caption, battle_id = await play_battle(bot, msg.from_user.id, target_id)
+        res = await play_battle(bot, msg.from_user.id, target_id)
     except BattleLimit:
         await msg.answer(f"Вы уже сыграли {PAIR_LIMIT} батлов за час. Дай отдохнуть рейтингу.")
         return
@@ -585,8 +630,8 @@ async def duel_and_reply(msg: Message, bot: Bot, target_id: int) -> None:
         logger.warning("Батл не удался (%s vs %s): %s", msg.from_user.id, target_id, e)
         await msg.answer("Не получилось. Соперник должен хотя бы раз написать боту.")
         return
-    await msg.answer_photo(BufferedInputFile(card.read(), filename="result.jpg"),
-                           caption=caption, reply_markup=result_kb(battle_id))
+    await msg.answer_photo(BufferedInputFile(res.card.read(), filename="result.jpg"), caption=res.caption,
+                           reply_markup=result_kb(res.battle_id, share_text=res.share_text))
 
 
 @router.callback_query(F.data == "private_duel")
@@ -724,8 +769,9 @@ async def cb_accept(call: CallbackQuery, bot: Bot) -> None:
         return
 
     try:
-        card, caption, battle_id = await play_battle(bot, p1_id, p2_id)
-        await show_card_in_message(call, bot, card, caption, result_kb(battle_id))
+        res = await play_battle(bot, p1_id, p2_id)
+        await show_card_in_message(call, bot, res.card, res.caption,
+                                   result_kb(res.battle_id, share_text=res.share_text))
         await call.answer("Батл сыгран!")
     except Exception as e:
         logger.error("Ошибка батла по вызову: %s", e)
@@ -751,8 +797,9 @@ async def cb_rematch(call: CallbackQuery, bot: Bot) -> None:
         await call.answer("Реванш уже был сыгран.", show_alert=True)
         return
     try:
-        card, caption, battle_id = await play_battle(bot, p1_id, p2_id, rematch=True)
-        await show_card_in_message(call, bot, card, caption, result_kb(battle_id, rematch=False))
+        res = await play_battle(bot, p1_id, p2_id, rematch=True)
+        await show_card_in_message(call, bot, res.card, res.caption,
+                                   result_kb(res.battle_id, rematch=False, share_text=res.share_text))
         await call.answer("Реванш сыгран!")
     except Exception as e:
         logger.error("Ошибка реванша: %s", e)
@@ -797,6 +844,30 @@ async def ensure_brand_card(bot: Bot) -> None:
         logger.info("Фирменная карточка загружена")
 
 
+async def setup_bot_profile(bot: Bot) -> None:
+    """Меню команд и описание бота (видно на странице бота и в пустом чате). Поля бота — только наши."""
+    try:
+        await bot.set_my_commands([
+            BotCommand(command="start", description="Меню"),
+            BotCommand(command="duel", description="Батл с игроком (ответом на сообщение)"),
+            BotCommand(command="spar", description="Тренировка с ботом"),
+            BotCommand(command="me", description="Мой ранг и статистика"),
+            BotCommand(command="topmog", description="Топ моггеров"),
+            BotCommand(command="week", description="Топ недели"),
+            BotCommand(command="history", description="Мои последние батлы"),
+            BotCommand(command="invite", description="Пригласить друзей"),
+            BotCommand(command="how", description="Как считается батл"),
+            BotCommand(command="hide", description="Скрыть себя из топов"),
+        ])
+        await bot.set_my_short_description("Батл Telegram-профилей: кто круче? Бросай вызов друзьям в любом чате.")
+        await bot.set_my_description(
+            "MOG BATTLE сравнивает Telegram-профили: аватар, ник, био, Premium, оформление и возраст аккаунта.\n\n"
+            "Вызывай друзей в любом чате командой @MOGGEDSTARSBOT mogg, побеждай, поднимайся в рейтинге "
+            "и получай ранги от Sub 3 до True Adam.")
+    except Exception as e:
+        logger.warning("Не удалось обновить профиль бота: %s", e)
+
+
 # ---------- ЗАПУСК ----------
 async def main() -> None:
     if not BOT_TOKEN:
@@ -819,6 +890,7 @@ async def main() -> None:
             pass
         return True
 
+    await setup_bot_profile(bot)
     asyncio.create_task(backup_loop())
     asyncio.create_task(cleanup_loop())
     asyncio.create_task(ensure_brand_card(bot))  # не блокирует старт

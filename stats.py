@@ -181,13 +181,35 @@ def average_score(stats: list[float]) -> float:
 
 DRAW_EPS = 0.15
 
-def roll_battle(l1: list[float], l2: list[float]) -> tuple[list[float], list[float], str]:
+UPSET_GAP = 0.8  # насколько слабее по «чистым» оценкам должен быть победитель, чтобы это был апсет
+
+@dataclass
+class BattleRoll:
+    a: list[float]        # оценки первого игрока с учётом «формы дня»
+    b: list[float]
+    outcome: str          # p1 / p2 / draw
+    form1: float          # «форма дня» (сдвиг) каждого
+    form2: float
+    upset: bool           # победил заметно более слабый профиль
+
+def roll_battle(l1: list[float], l2: list[float]) -> BattleRoll:
     """Добавляет «форму дня» (случайный сдвиг) и определяет исход: p1 / p2 / draw."""
-    def jitter(lst: list[float]) -> list[float]:
+    def jitter(lst: list[float]) -> tuple[list[float], float]:
         shift = random.uniform(-0.8, 0.8)
-        return [round(min(10.0, max(0.0, v + shift + random.uniform(-0.4, 0.4))), 2) for v in lst]
-    a, b = jitter(l1), jitter(l2)
+        return [round(min(10.0, max(0.0, v + shift + random.uniform(-0.4, 0.4))), 2) for v in lst], shift
+    (a, f1), (b, f2) = jitter(l1), jitter(l2)
     s1, s2 = average_score(a), average_score(b)
     if abs(s1 - s2) < DRAW_EPS:
-        return a, b, "draw"
-    return a, b, "p1" if s1 > s2 else "p2"
+        return BattleRoll(a, b, "draw", f1, f2, False)
+    outcome = "p1" if s1 > s2 else "p2"
+    base1, base2 = average_score(l1), average_score(l2)
+    upset = (base1 + UPSET_GAP <= base2) if outcome == "p1" else (base2 + UPSET_GAP <= base1)
+    return BattleRoll(a, b, outcome, f1, f2, upset)
+
+
+def battle_insight(a: list[float], b: list[float]) -> tuple[int, int, int, float]:
+    """(раундов у первого, раундов у второго, индекс самого решающего параметра, его перевес)."""
+    r1 = sum(1 for x, y in zip(a, b) if x > y)
+    r2 = sum(1 for x, y in zip(a, b) if y > x)
+    best = max(range(len(a)), key=lambda i: abs(a[i] - b[i]) * WEIGHTS[i])
+    return r1, r2, best, a[best] - b[best]

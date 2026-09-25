@@ -12,7 +12,7 @@ import httpx
 from PIL import Image, ImageDraw, ImageFont
 
 try:
-    from stats import Rank, average_score
+    from stats import Rank, average_score, battle_insight, WEIGHTS
 except ImportError:  # запуск отдельно от проекта
     class Rank:
         def __init__(self, name: str, color: str):
@@ -21,6 +21,11 @@ except ImportError:  # запуск отдельно от проекта
 
     def average_score(stats: List[float]) -> float:
         return sum(stats) / len(stats) if stats else 0.0
+
+    WEIGHTS = [1.0] * 7
+
+    def battle_insight(a, b):
+        return 0, 0, 0, 0.0
 
 logger = logging.getLogger(__name__)
 
@@ -213,7 +218,7 @@ async def make_result_card(
     p2_value: Optional[float] = None,
     **kwargs,
 ) -> io.BytesIO:
-    W, H = 1080, 1490
+    W, H = 1080, 1540
     cv = Canvas(W, H)
     is_draw = bool(kwargs.get("is_draw"))
     s1, s2 = average_score(p1_stats), average_score(p2_stats)
@@ -224,7 +229,10 @@ async def make_result_card(
 
     # --- шапка: два игрока ---
     cv.rr((40, 170, W - 40, 690), 44, fill=CARD)
-    cv.text((W / 2, 352), "VS", 30, fill=LABEL2, bold=True)
+    r1, r2, best, best_delta = battle_insight(p1_stats, p2_stats)
+    cv.text((W / 2, 318), "VS", 28, fill=LABEL2, bold=True)
+    cv.text((W / 2, 372), f"{r1} : {r2}", 46, bold=True)
+    cv.text((W / 2, 412), "параметры", 20, fill=LABEL2)
     players = [
         (290, p1_name, p1_photo, p1_rank, s1, p1_wins),
         (790, p2_name, p2_photo, p2_rank, s2, not p1_wins),
@@ -240,8 +248,19 @@ async def make_result_card(
         status = "Ничья" if is_draw else ("Победа" if is_win else "Поражение")
         cv.pill(cx, 636, status, 24, fg=color, bg=_mix(color, CARD, 0.18), padx=26, h=48)
 
+    # --- что решило исход ---
+    if is_draw:
+        note, note_color = f"Ничья · разница {abs(s1 - s2):.2f}", BLUE
+    else:
+        label = ROW_LABELS[best] if ROW_LABELS[best] == "Premium" else ROW_LABELS[best].lower()
+        note = f"Решил: {label} {abs(best_delta):+.1f}"
+        note_color = BLUE
+        if kwargs.get("upset"):
+            note, note_color = "Апсет · " + note, ORANGE
+    cv.pill(W / 2, 730, note, 26, fg=note_color, bg=_mix(note_color, BG, 0.16), padx=30, h=54)
+
     # --- сравнение по параметрам ---
-    top, row_h = 720, 88
+    top, row_h = 776, 88
     cv.rr((40, top, W - 40, top + 7 * row_h + 32), 44, fill=CARD)
 
     def subs(n: str, avatars, ulen, bio, name, value) -> List[str]:
@@ -263,12 +282,19 @@ async def make_result_card(
         c1 = BLUE if v1 == v2 else (GREEN if v1 > v2 else FILL_OFF)
         c2 = BLUE if v1 == v2 else (GREEN if v2 > v1 else FILL_OFF)
 
-        cv.text((W / 2, cy - 6), ROW_LABELS[i], 24, fill=WHITE, bold=True)
+        weight = WEIGHTS[i] if i < len(WEIGHTS) else 1.0
+        cv.text((W / 2, cy - (12 if weight != 1.0 else 6)), ROW_LABELS[i], 24, fill=WHITE, bold=True)
+        if weight != 1.0:
+            cv.text((W / 2, cy + 16), f"×{weight:g}", 17, fill=LABEL2)
         for side, v, col, sub in ((-1, v1, c1, sub1[i]), (1, v2, c2, sub2[i])):
             edge = left_edge if side < 0 else right_edge
             anchor = "rm" if side < 0 else "lm"
             strong = col in (GREEN, BLUE)
             cv.text((edge, cy - 24), f"{v:.1f}", 32, fill=WHITE if strong else LABEL2, bold=True, anchor=anchor)
+            other = v2 if side < 0 else v1
+            if v - other >= 0.5:  # перевес победителя параметра
+                dx = cv.width_of(f"{v:.1f}", 32, True) + 10
+                cv.text((edge - dx if side < 0 else edge + dx, cy - 22), f"+{v - other:.1f}", 20, fill=GREEN, bold=True, anchor=anchor)
             bx0, bx1 = (edge - bar_max, edge) if side < 0 else (edge, edge + bar_max)
             cv.rr((bx0, cy + 2, bx1, cy + 12), 5, fill=CARD2)
             fill_w = max(10, int(bar_max * min(max(v, 0.0) / 10.0, 1.0)))
@@ -279,8 +305,8 @@ async def make_result_card(
             cv.text((edge, cy + 30), sub, 18, fill=LABEL2, anchor=anchor)
 
     # --- подпись: карточку пересылают, это и есть реклама ---
-    cv.text((W / 2, 1418), "Сравни свой профиль", 22, fill=LABEL2)
-    cv.pill(W / 2, 1452, "@MOGGEDSTARSBOT", 24, fg=BLUE, bg=_mix(BLUE, BG, 0.16), padx=26, h=44)
+    cv.text((W / 2, 1468), "Сравни свой профиль", 22, fill=LABEL2)
+    cv.pill(W / 2, 1502, "@MOGGEDSTARSBOT", 24, fg=BLUE, bg=_mix(BLUE, BG, 0.16), padx=26, h=44)
     return cv.to_jpeg()
 
 
