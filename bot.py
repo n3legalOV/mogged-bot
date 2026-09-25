@@ -10,6 +10,7 @@ import html
 import logging
 import os
 import random
+import re
 import time
 import uuid
 from io import BytesIO
@@ -62,7 +63,8 @@ PAIR_WINDOW = 3600
 CARD_CACHE_TTL = 600    # секунд держим file_id карточки вызова
 MSK = datetime.timezone(datetime.timedelta(hours=3))
 
-_card_cache: dict[int, tuple[float, str, str]] = {}   # user_id -> (время, file_id, ранг)
+_card_cache: dict[tuple[int, str], tuple[float, str, str]] = {}   # (user_id, адресат) -> (время, file_id, ранг)
+USERNAME_RE = re.compile(r"[A-Za-z][A-Za-z0-9_]{3,31}")
 _last_spar: dict[int, float] = {}
 
 NPCS = [  # тренировочные соперники: (имя, оценки по 7 параметрам)
@@ -159,10 +161,11 @@ def chat_decor(chat) -> int:
 def main_menu_kb(user_id: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="Вызвать всех", switch_inline_query="mogg"),
-         InlineKeyboardButton(text="Батл в личке", callback_data="private_duel")],
-        [InlineKeyboardButton(text="Спарринг с ботом", callback_data="spar"),
-         InlineKeyboardButton(text="Топ", switch_inline_query="top")],
-        [InlineKeyboardButton(text="Пригласить друзей", url=share_url(user_id))],
+         InlineKeyboardButton(text="Вызвать по нику", switch_inline_query="@")],
+        [InlineKeyboardButton(text="Батл в личке", callback_data="private_duel"),
+         InlineKeyboardButton(text="Спарринг с ботом", callback_data="spar")],
+        [InlineKeyboardButton(text="Топ", switch_inline_query="top"),
+         InlineKeyboardButton(text="Пригласить друзей", url=share_url(user_id))],
         [InlineKeyboardButton(text="Поддержать", url=SUPPORT_URL)],
     ])
 
@@ -197,7 +200,8 @@ WELCOME = (
     "<b>MOG BATTLE</b>\n\n"
     "Сравниваем Telegram-профили: аватар, ник, био, Premium, оформление, возраст аккаунта.\n"
     "Бросай вызов, побеждай и поднимайся в рейтинге.\n\n"
-    "Быстрый вызов в любом чате: <code>@MOGGEDSTARSBOT mogg</code>\n"
+    "Вызов всем в любом чате: <code>@MOGGEDSTARSBOT mogg</code>\n"
+    "Вызов конкретному игроку: <code>@MOGGEDSTARSBOT @ник</code>\n"
     "В группе: ответь на сообщение командой /duel\n\n"
     "/me · /topmog · /week · /history · /invite"
 )
@@ -715,37 +719,63 @@ async def inline_handler(query: InlineQuery, bot: Bot) -> None:
         await query.answer([week_result, top_result], cache_time=5, is_personal=False)
         return
 
+    raw = query.query.strip()
+    target = None
+    if raw.startswith("@"):  # адресный вызов: @MOGGEDSTARSBOT @ник
+        parts = raw[1:].split()
+        name = parts[0] if parts else ""
+        if not USERNAME_RE.fullmatch(name):
+            hint = InlineQueryResultArticle(
+                id="hint", title="Введи ник соперника", description="Например: @username",
+                input_message_content=InputTextMessageContent(
+                    message_text="Вызов конкретному игроку: <code>@MOGGEDSTARSBOT @ник</code>", parse_mode="HTML"))
+            await query.answer([hint], cache_time=1, is_personal=True)
+            return
+        if user.username and name.lower() == user.username.lower():
+            hint = InlineQueryResultArticle(
+                id="self", title="Нельзя вызвать самого себя", description="Укажи ник соперника",
+                input_message_content=InputTextMessageContent(message_text="Нужен соперник, а не зеркало."))
+            await query.answer([hint], cache_time=1, is_personal=True)
+            return
+        target = name
+
     rank = get_rank(db.get_player(user.id)["wins"])
     uname = user.username or user.first_name or str(user.id)
     challenge_id = str(uuid.uuid4())[:12]
-    db.add_challenge(challenge_id, user.id, uname)
-    caption_text = (f"{display(user.username, user.first_name, user.id)} бросает вызов.\n\n"
-                    "Кто в этом чате достаточно MOG, чтобы принять его?")
+    db.add_challenge(challenge_id, user.id, uname, target)
+    me = display(user.username, user.first_name, user.id)
+    if target:
+        caption_text = f"{me} вызывает {make_mention(target)} на батл.\n\nПринять вызов может только он."
+        title, desc = f"Вызвать @{target}", "Принять сможет только он"
+    else:
+        caption_text = f"{me} бросает вызов.\n\nКто в этом чате достаточно MOG, чтобы принять его?"
+        title, desc = "Бросить открытый вызов", f"Батл против {uname}"
 
-    cached = _card_cache.get(user.id)
+    cache_key = (user.id, (target or "").lower())
+    cached = _card_cache.get(cache_key)
     if cached and time.monotonic() - cached[0] < CARD_CACHE_TTL and cached[2] == rank.name:
         file_id = cached[1]  # карточка не менялась — не рендерим и не заливаем заново
     else:
         photo_url = await get_photo_url(bot, user.id)
-        card_buf = await ig.make_challenge_card(uname, photo_url, rank)
+        card_buf = await ig.make_challenge_card(uname, photo_url, rank, target)
         file_id = await upload_card_to_telegram(bot, user.id, card_buf)
         if file_id:
-            _card_cache[user.id] = (time.monotonic(), file_id, rank.name)
+            _card_cache[cache_key] = (time.monotonic(), file_id, rank.name)
     file_id = file_id or db.kv_get("brand_file_id")  # нет личной карточки — фирменная
 
     if file_id:
         challenge_result = InlineQueryResultCachedPhoto(
-            id=challenge_id, photo_file_id=file_id,
-            title="Бросить открытый вызов", description=f"Батл против {uname}",
+            id=challenge_id, photo_file_id=file_id, title=title, description=desc,
             caption=caption_text, parse_mode="HTML", reply_markup=accept_kb(challenge_id),
         )
     else:
         challenge_result = InlineQueryResultArticle(
-            id=challenge_id, title="Бросить открытый вызов", description=f"Батл против {uname}",
+            id=challenge_id, title=title, description=desc,
             input_message_content=InputTextMessageContent(message_text=caption_text, parse_mode="HTML"),
             reply_markup=accept_kb(challenge_id),
         )
-    await query.answer([challenge_result, top_result], cache_time=1, is_personal=True)
+    results = [challenge_result] if target else [challenge_result, top_result]
+    await query.answer(results, cache_time=1, is_personal=True)
 
 
 # ---------- ПРИНЯТИЕ ВЫЗОВА ----------
@@ -759,6 +789,10 @@ async def cb_accept(call: CallbackQuery, bot: Bot) -> None:
         return
     if call.from_user.id == data["challenger_id"]:
         await call.answer("Нельзя принять собственный вызов.", show_alert=True)
+        return
+    target = data["target_username"]
+    if target and (call.from_user.username or "").lower() != target.lower():
+        await call.answer(f"Этот вызов адресован @{target}.", show_alert=True)
         return
     p1_id, p2_id = data["challenger_id"], call.from_user.id
     if db.pair_battles_recent(p1_id, p2_id, PAIR_WINDOW) >= PAIR_LIMIT:

@@ -62,6 +62,8 @@ def init_db() -> None:
         conn.execute("CREATE INDEX IF NOT EXISTS idx_players_wins ON players(wins DESC)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_battles_ts ON battles(ts)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_battles_pair ON battles(p1_id, p2_id, ts)")
+        if "target_username" not in {r[1] for r in conn.execute("PRAGMA table_info(challenges)")}:
+            conn.execute("ALTER TABLE challenges ADD COLUMN target_username TEXT")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_challenges_created ON challenges(created_at)")
         conn.commit()
     cleanup_challenges()
@@ -119,10 +121,11 @@ def record_draw(a_id: int, b_id: int) -> None:
         conn.commit()
 
 
-def add_challenge(cid: str, challenger_id: int, name: str) -> None:
+def add_challenge(cid: str, challenger_id: int, name: str, target_username: Optional[str] = None) -> None:
+    """target_username — адресный вызов: принять может только игрок с этим ником."""
     with get_conn() as conn:
-        conn.execute("INSERT OR REPLACE INTO challenges (id, challenger_id, challenger_name) VALUES (?, ?, ?)",
-                     (cid, challenger_id, name))
+        conn.execute("INSERT OR REPLACE INTO challenges (id, challenger_id, challenger_name, target_username) "
+                     "VALUES (?, ?, ?, ?)", (cid, challenger_id, name, target_username))
         conn.commit()
 
 

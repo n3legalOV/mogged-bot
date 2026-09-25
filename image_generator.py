@@ -174,13 +174,15 @@ def _rank_pill(cv: Canvas, cx, cy, rank: Any, size: int = 22):
 # ==========================================
 # 1. КАРТОЧКА ВЫЗОВА
 # ==========================================
-async def make_challenge_card(challenger_name: str, photo_url: Optional[str], rank: Any) -> io.BytesIO:
+async def make_challenge_card(challenger_name: str, photo_url: Optional[str], rank: Any,
+                              target: Optional[str] = None) -> io.BytesIO:
+    """target — ник адресата (адресный вызов) или None (открытый вызов)."""
     W, H = 1080, 720
     cv = Canvas(W, H)
     cv.rr((40, 40, W - 40, H - 40), 44, fill=CARD)
 
     cv.text((W / 2, 112), "MOG BATTLE", 26, fill=LABEL2, bold=True)
-    cv.text((W / 2, 170), "Открытый вызов", 54, bold=True)
+    cv.text((W / 2, 170), "Вызов на батл" if target else "Открытый вызов", 54, bold=True)
 
     cy, r = 385, 100
     left_x, right_x = 300, 780
@@ -196,8 +198,12 @@ async def make_challenge_card(challenger_name: str, photo_url: Optional[str], ra
     name = challenger_name or "Игрок"
     cv.text((left_x, 528), cv.fit(name, 380, 36, True), 36, bold=True)
     _rank_pill(cv, left_x, 578, rank)
-    cv.text((right_x, 528), "Любой игрок", 36, bold=True)
-    cv.text((right_x, 578), "первый нажавший", 24, fill=LABEL2)
+    if target:
+        cv.text((right_x, 528), cv.fit("@" + target, 380, 36, True), 36, bold=True)
+        cv.text((right_x, 578), "вызов адресован ему", 24, fill=LABEL2)
+    else:
+        cv.text((right_x, 528), "Любой игрок", 36, bold=True)
+        cv.text((right_x, 578), "первый нажавший", 24, fill=LABEL2)
 
     cv.pill(W / 2, 646, "@MOGGEDSTARSBOT", 24, fg=BLUE, bg=_mix(BLUE, CARD, 0.16), padx=26, h=48)
     return cv.to_jpeg()
