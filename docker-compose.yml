@@ -1,0 +1,8 @@
+services:
+  bot:
+    build: .
+    restart: unless-stopped
+    env_file: .env
+    volumes:
+      - ./ghostclash.db:/app/ghostclash.db
+      - ./backups:/app/backups
